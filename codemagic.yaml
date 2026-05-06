@@ -1,0 +1,66 @@
+workflows:
+  flios-dev:
+    name: flios - iOS simulator dev session
+    instance_type: mac_mini_m2
+    max_build_duration: 60
+    environment:
+      flutter: stable
+      vars:
+        FLIOS_DEVICE: "iPhone 16 Pro"
+        FLIOS_MODE: "simulator"
+    triggering:
+      events:
+        - push
+      branch_patterns:
+        - pattern: 'flios/dev'
+          include: true
+    scripts:
+      - name: Pub get
+        script: |
+          flutter pub get
+      - name: Boot iOS simulator
+        script: |
+          DEVICE_NAME="${FLIOS_DEVICE:-iPhone 16 Pro}"
+          UDID=$(xcrun simctl list devices available | grep -E "$DEVICE_NAME \(" | head -1 | sed -E 's/.*\(([0-9A-F-]+)\).*/\1/')
+          if [ -z "$UDID" ]; then
+            echo "[flios] Simulator '$DEVICE_NAME' not found, falling back to first available iPhone"
+            UDID=$(xcrun simctl list devices available | grep -E "iPhone " | head -1 | sed -E 's/.*\(([0-9A-F-]+)\).*/\1/')
+          fi
+          echo "[flios] Booting simulator $DEVICE_NAME ($UDID)"
+          xcrun simctl boot "$UDID" || true
+          open -a Simulator
+          echo "$UDID" > /tmp/flios-udid
+      - name: Start VM-side git watcher
+        script: |
+          cat > /tmp/flios-watch.sh <<'EOF'
+          #!/bin/bash
+          cd "$CM_BUILD_DIR"
+          FLUTTER_PID_FILE="/tmp/flios-flutter.pid"
+          while true; do
+            git fetch origin flios/dev --quiet || true
+            LOCAL=$(git rev-parse HEAD)
+            REMOTE=$(git rev-parse origin/flios/dev 2>/dev/null || echo "")
+            if [ -n "$REMOTE" ] && [ "$LOCAL" != "$REMOTE" ]; then
+              echo "[flios] Changes detected, pulling..."
+              git reset --hard origin/flios/dev
+              flutter pub get --quiet 2>/dev/null || true
+              if [ -f "$FLUTTER_PID_FILE" ]; then
+                FLUTTER_PID=$(cat "$FLUTTER_PID_FILE")
+                echo "r" > "/proc/$FLUTTER_PID/fd/0" 2>/dev/null || true
+              fi
+              echo "[flios] Hot reload triggered"
+            fi
+            sleep 3
+          done
+          EOF
+          chmod +x /tmp/flios-watch.sh
+          nohup /tmp/flios-watch.sh > /tmp/flios-watch.log 2>&1 &
+          echo "[flios] Watcher started (PID $!)"
+      - name: Flutter run on simulator
+        script: |
+          UDID=$(cat /tmp/flios-udid)
+          echo "[flios] Running flutter on $UDID"
+          flutter run -d "$UDID" &
+          FLUTTER_PID=$!
+          echo "$FLUTTER_PID" > /tmp/flios-flutter.pid
+          wait $FLUTTER_PID
